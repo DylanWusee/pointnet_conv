@@ -90,7 +90,7 @@ if __name__=='__main__':
             _, idx = knn_point(nsample, xyz1, xyz2)
             grouped_points = group_point(points, idx)
         else:
-            idx, _ = query_ball_point(radius, nsample, xyz1, xyz2)
+            idx, _ = query_ball_point(radius, nsample, xyz1, xyz1)
             grouped_points = group_point(points, idx)
             #grouped_points_grad = tf.ones_like(grouped_points)
             #points_grad = tf.gradients(grouped_points, points, grouped_points_grad)
@@ -100,6 +100,6 @@ if __name__=='__main__':
             ret = sess.run(grouped_points)
         print time.time() - now
         print ret.shape, ret.dtype
-        print ret
+        #print ret
 
 

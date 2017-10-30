@@ -61,8 +61,8 @@ def evaluate(num_votes):
         is_training_pl = tf.placeholder(tf.bool, shape=())
 
         # simple model
-        net, end_points = MODEL.get_model_add_global(pointclouds_pl, is_training_pl)
-        pred = net['pc_fc3']
+        pred, end_points = MODEL.get_model_add_grouping(pointclouds_pl, is_training_pl)
+        #pred = net['pc_fc3']
         loss = MODEL.get_loss(pred, labels_pl, end_points)
         
         # Add ops to save and restore all the variables.
