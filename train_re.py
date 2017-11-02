@@ -12,6 +12,7 @@ sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, 'models'))
 sys.path.append(os.path.join(BASE_DIR, 'utils'))
 sys.path.append(os.path.join(BASE_DIR, 'tf_ops/grouping'))
+sys.path.append(os.path.join(BASE_DIR, 'tf_ops/grouping'))
 import provider
 import tf_util
 
@@ -27,8 +28,9 @@ parser.add_argument('--momentum', type=float, default=0.9, help='Initial learnin
 parser.add_argument('--optimizer', default='adam', help='adam or momentum [default: adam]')
 parser.add_argument('--decay_step', type=int, default=200000, help='Decay step for lr decay [default: 200000]')
 parser.add_argument('--decay_rate', type=float, default=0.7, help='Decay rate for lr decay [default: 0.8]')
+parser.add_argument('--is_finetune', type=bool, default=False, help='FineTune Mode Or not [default: False]')
+parser.add_argument('--weight_path', default='log_re/model.ckpt', help='FineTune Weight Path [default log_re/model.ckpt]')
 FLAGS = parser.parse_args()
-
 
 BATCH_SIZE = FLAGS.batch_size
 NUM_POINT = FLAGS.num_point
@@ -39,6 +41,8 @@ MOMENTUM = FLAGS.momentum
 OPTIMIZER = FLAGS.optimizer
 DECAY_STEP = FLAGS.decay_step
 DECAY_RATE = FLAGS.decay_rate
+IS_FINETUNE = FLAGS.is_finetune
+WEIGHT_PATH = FLAGS.weight_path
 
 MODEL = importlib.import_module(FLAGS.model) # import network module
 MODEL_FILE = os.path.join(BASE_DIR, 'models', FLAGS.model+'.py')
@@ -78,7 +82,7 @@ def get_learning_rate(batch):
                         DECAY_STEP,          # Decay step.
                         DECAY_RATE,          # Decay rate.
                         staircase=True)
-    learning_rate = tf.maximum(learning_rate, 0.00001) # CLIP THE LEARNING RATE!
+    learning_rate = tf.maximum(learning_rate, 0.0000001) # CLIP THE LEARNING RATE!
     return learning_rate
 
 def get_bn_decay(batch):
@@ -105,7 +109,7 @@ def train():
             tf.summary.scalar('bn_decay', bn_decay)
 
             # Get model and loss
-            pred, end_points = MODEL.get_model_add_grouping(pointclouds_pl, is_training_pl, bn_decay=bn_decay)
+            pred, end_points = MODEL.get_model_add_grouping_google(pointclouds_pl, is_training_pl, bn_decay=bn_decay)
             loss = MODEL.get_loss(pred, labels_pl, end_points)
             tf.summary.scalar('loss', loss)
 
@@ -146,6 +150,12 @@ def train():
         #sess.run(init)
         sess.run(init, {is_training_pl: True})
 
+        if IS_FINETUNE:
+            # Restore variables from disk.
+            log_string("load Weight From %s" % WEIGHT_PATH)
+            saver.restore(sess, WEIGHT_PATH)
+            log_string("Model restored.")
+
         ops = {'pointclouds_pl': pointclouds_pl,
                'labels_pl': labels_pl,
                'is_training_pl': is_training_pl,
@@ -155,6 +165,10 @@ def train():
                'merged': merged,
                'step': batch}
 
+        if IS_FINETUNE:
+            print 'Test weight!!!'
+            eval_one_epoch(sess, ops, test_writer)
+
         for epoch in range(MAX_EPOCH):
             log_string('**** EPOCH %03d ****' % (epoch))
             sys.stdout.flush()
@@ -163,7 +177,7 @@ def train():
             eval_one_epoch(sess, ops, test_writer)
 
             # Save the variables to disk.
-            if epoch % 10 == 0:
+            if (epoch - 10) % 10 == 0:
                 save_path = saver.save(sess, os.path.join(LOG_DIR, "model.ckpt"))
                 log_string("Model saved in file: %s" % save_path)
 
@@ -198,11 +212,11 @@ def train_one_epoch(sess, ops, train_writer):
             # Augment batched point clouds by rotation and jittering
             rotated_data = provider.rotate_point_cloud(current_data[start_idx:end_idx, :, :])
             jittered_data = provider.jitter_point_cloud(rotated_data)
-            feed_dict = {ops['pointclouds_pl']: jittered_data,
+            feed_dict = {ops['pointclouds_pl']: jittered_data, 
                          ops['labels_pl']: current_label[start_idx:end_idx],
                          ops['is_training_pl']: is_training,}
             summary, step, _, loss_val, pred_val = sess.run([ops['merged'], ops['step'],
-                ops['train_op'], ops['loss'], ops['pred']], feed_dict=feed_dict)
+                ops['train_op'], ops['loss'], ops['pred']], feed_dict=feed_dict)  
             train_writer.add_summary(summary, step)
             pred_val = np.argmax(pred_val, 1)
             correct = np.sum(pred_val == current_label[start_idx:end_idx])
@@ -210,7 +224,7 @@ def train_one_epoch(sess, ops, train_writer):
             total_seen += BATCH_SIZE
             loss_sum += loss_val
 
-        log_string('mean loss: %f' % (loss_sum / float(num_batches)))
+        log_string('mean loss: %f' % (loss_sum / float(total_seen)))
         log_string('accuracy: %f' % (total_correct / float(total_seen)))
 
 
@@ -245,7 +259,7 @@ def eval_one_epoch(sess, ops, test_writer):
             correct = np.sum(pred_val == current_label[start_idx:end_idx])
             total_correct += correct
             total_seen += BATCH_SIZE
-            loss_sum += (loss_val*BATCH_SIZE)
+            loss_sum += (loss_val)
             for i in range(start_idx, end_idx):
                 l = current_label[i]
                 total_seen_class[l] += 1

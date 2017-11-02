@@ -7,9 +7,11 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(BASE_DIR)
 sys.path.append(os.path.join(BASE_DIR, '../utils'))
 sys.path.append(os.path.join(BASE_DIR, '../tf_ops/grouping'))
+sys.path.append(os.path.join(BASE_DIR, '../tf_ops/sampling'))
 import tf_util
 from transform_nets import input_transform_net, feature_transform_net
 from tf_grouping import query_ball_point, group_point, knn_point
+from tf_sampling import farthest_point_sample, gather_point
 
 def placeholder_inputs(batch_size, num_point):
     pointclouds_pl = tf.placeholder(tf.float32, shape=(batch_size, num_point, 3))
@@ -407,7 +409,7 @@ def get_model_add_grouping(point_cloud, is_training, bn_decay=None):
     point_cloud_transformed = tf.matmul(point_cloud, transform)
     #input_image = tf.expand_dims(point_cloud_transformed, -1)
 
-    group_num = 32
+    group_num = 8
     group_radius = 0.5
 
     idx, _ = query_ball_point(group_radius, group_num, point_cloud_transformed, point_cloud_transformed)
@@ -465,7 +467,7 @@ def get_model_add_grouping(point_cloud, is_training, bn_decay=None):
 
     return net, end_points
 
-def get_model_add_grouping_no_max(point_cloud, is_training, bn_decay=None):
+def get_model_add_grouping_ds(point_cloud, is_training, bn_decay=None):
     """ Classification PointNet, input is BxNx3, output Bx40 """
     batch_size = point_cloud.get_shape()[0].value
     num_point = point_cloud.get_shape()[1].value
@@ -476,16 +478,20 @@ def get_model_add_grouping_no_max(point_cloud, is_training, bn_decay=None):
     point_cloud_transformed = tf.matmul(point_cloud, transform)
     #input_image = tf.expand_dims(point_cloud_transformed, -1)
 
-    idx, _ = query_ball_point(0.1, 16, point_cloud_transformed, point_cloud_transformed)
-    input_image = group_point(point_cloud_transformed, idx)
+    group_num = 8
+    group_radius = 0.5
+    xyz1 = point_cloud_transformed
+    xyz2 = point_cloud_transformed
 
-    net = tf_util.conv2d(input_image, 64, [1,16],
+    idx, _ = query_ball_point(group_radius, group_num, point_cloud_transformed, point_cloud_transformed)
+    
+    input_image = tf.expand_dims(point_cloud_transformed, -1)
+    net = tf_util.conv2d(input_image, 64, [1,3],
                          padding='VALID', stride=[1,1],
                          bn=True, is_training=is_training,
                          scope='conv1', bn_decay=bn_decay)
 
-    net = group_point(tf.squeeze(net), idx)
-    net = tf_util.conv2d(net, 64, [1,16],
+    net = tf_util.conv2d(net, 64, [1,1],
                          padding='VALID', stride=[1,1],
                          bn=True, is_training=is_training,
                          scope='conv2', bn_decay=bn_decay)
@@ -497,32 +503,146 @@ def get_model_add_grouping_no_max(point_cloud, is_training, bn_decay=None):
     #net_transformed = tf.expand_dims(net_transformed, [2])
 
     net_transformed = group_point(net_transformed, idx)
-    net = tf_util.conv2d(net_transformed, 64, [1,16],
+    net = tf_util.conv2d(net_transformed, 128, [1,group_num],
                          padding='VALID', stride=[1,1],
                          bn=True, is_training=is_training,
                          scope='conv3', bn_decay=bn_decay)
 
     net = group_point(tf.squeeze(net), idx)
-    net = tf_util.conv2d(net, 128, [1,16],
+    net = tf_util.max_pool2d(net, [1,group_num],
+                             padding='VALID', scope='maxpool1')
+
+    #downsample
+    xyz1 = xyz2
+    xyz2 = gather_point(xyz1,farthest_point_sample(net.get_shape()[1] / group_num,xyz1))
+    idx, _ = query_ball_point(group_radius * 2, group_num, xyz1, xyz2)
+    net = group_point(tf.squeeze(net), idx)
+
+    net = tf_util.conv2d(net, 512, [1,group_num],
                          padding='VALID', stride=[1,1],
                          bn=True, is_training=is_training,
                          scope='conv4', bn_decay=bn_decay)
 
     net = group_point(tf.squeeze(net), idx)
-    net = tf_util.conv2d(net, 1024, [1,16],
+    net = tf_util.max_pool2d(net, [1,group_num],
+                             padding='VALID', scope='maxpool2')
+
+    #downsample
+    xyz1 = xyz2
+    xyz2 = gather_point(xyz1,farthest_point_sample(net.get_shape()[1] / group_num,xyz1))
+    idx, _ = query_ball_point(group_radius * 2, group_num, xyz1, xyz2)
+    net = group_point(tf.squeeze(net), idx)
+
+    net = tf_util.conv2d(net, 1024, [1,group_num],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv5', bn_decay=bn_decay)
+
+
+    # Symmetric function: max pooling
+    net = tf_util.max_pool2d(net, [net.get_shape()[1],1],
+                             padding='VALID', scope='maxpool3')
+
+    net = tf.reshape(net, [batch_size, -1])
+    net = tf_util.fully_connected(net, 512, bn=True, is_training=is_training,
+                                  scope='fc1', bn_decay=bn_decay)
+    net = tf_util.dropout(net, keep_prob=0.7, is_training=is_training,
+                          scope='dp1')
+    net = tf_util.fully_connected(net, 256, bn=True, is_training=is_training,
+                                  scope='fc2', bn_decay=bn_decay)
+    net = tf_util.dropout(net, keep_prob=0.7, is_training=is_training,
+                          scope='dp2')
+    net = tf_util.fully_connected(net, 40, activation_fn=None, scope='fc3')
+
+    return net, end_points
+
+def get_model_add_grouping_google(point_cloud, is_training, bn_decay=None):
+    """ Classification PointNet, input is BxNx3, output Bx40 """
+    batch_size = point_cloud.get_shape()[0].value
+    num_point = point_cloud.get_shape()[1].value
+    end_points = {}
+
+    with tf.variable_scope('transform_net1') as sc:
+        transform = input_transform_net(point_cloud, is_training, bn_decay, K=3)
+    point_cloud_transformed = tf.matmul(point_cloud, transform)
+    #input_image = tf.expand_dims(point_cloud_transformed, -1)
+
+    group_num = 32
+    group_radius = 0.5
+    ds_ratio = 0.5
+    xyz1 = point_cloud_transformed
+    xyz2 = point_cloud_transformed
+    
+    input_image = tf.expand_dims(point_cloud_transformed, -1)
+    net = tf_util.conv2d(input_image, 64, [1,3],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv1', bn_decay=bn_decay)
+
+    net = tf_util.conv2d(net, 64, [1,1],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv2', bn_decay=bn_decay)
+
+    with tf.variable_scope('transform_net2') as sc:
+        transform = feature_transform_net(net, is_training, bn_decay, K=64)
+    end_points['transform'] = transform
+    net_transformed = tf.matmul(tf.squeeze(net, axis=[2]), transform)
+    net_transformed = tf.expand_dims(net_transformed, [2])
+
+    net_1 = tf_util.conv2d(net_transformed, 64, [1,1],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv3_1', bn_decay=bn_decay)
+
+    idx, _ = query_ball_point(group_radius, group_num, point_cloud_transformed, point_cloud_transformed)
+    net_transformed = group_point(tf.squeeze(net_transformed), idx)
+
+    net_2 = tf_util.conv2d(net_transformed, 32, [1,1],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv3_2', bn_decay=bn_decay)
+
+    net_2 = tf_util.conv2d(net_2, 64, [1,group_num],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv3_3', bn_decay=bn_decay)
+
+    net_max = tf_util.max_pool2d(net_transformed, [1, group_num], stride=[1, 1],
+                             padding='VALID', scope='maxpool1')                     
+
+    net = tf.concat([net_1, net_2, net_max], axis=3)
+
+    net_1 = tf_util.conv2d(net, 256, [1,1],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv4_1', bn_decay=bn_decay)
+
+    net = group_point(tf.squeeze(net), idx)
+
+    net_2 = tf_util.conv2d(net, 64, [1,1],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv4_2', bn_decay=bn_decay)                    
+
+    net_2 = tf_util.conv2d(net_2, 256, [1,group_num],
+                         padding='VALID', stride=[1,1],
+                         bn=True, is_training=is_training,
+                         scope='conv4_3', bn_decay=bn_decay)
+
+    net_max = tf_util.max_pool2d(net, [1, net.get_shape()[2]], stride=[1, 1],
+                             padding='VALID', scope='maxpool2') 
+
+    net = tf.concat([net_1, net_2, net_max], axis=3)
+
+    net = tf_util.conv2d(net, 1024, [1,1],
                          padding='VALID', stride=[1,1],
                          bn=True, is_training=is_training,
                          scope='conv5', bn_decay=bn_decay)
 
     # Symmetric function: max pooling
-    #net = tf_util.max_pool2d(net, [num_point,1],
-    #                         padding='VALID', scope='maxpool')
-
-    net = tf_util.conv2d(net, 1024, [1024,1],
-                         padding='VALID', stride=[1,1],
-                         bn=True, is_training=is_training,
-                         scope='conv6', bn_decay=bn_decay)
-
+    net = tf_util.max_pool2d(net, [net.get_shape()[1],1], stride=[1, 1],
+                             padding='VALID', scope='maxpool')
 
     net = tf.reshape(net, [batch_size, -1])
     net = tf_util.fully_connected(net, 512, bn=True, is_training=is_training,
@@ -538,12 +658,12 @@ def get_model_add_grouping_no_max(point_cloud, is_training, bn_decay=None):
     return net, end_points
 
 
-
 def get_loss(pred, label, end_points, reg_weight=0.001):
     """ pred: B*NUM_CLASSES,
         label: B, """
     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=pred, labels=label)
-    classify_loss = tf.reduce_mean(loss)
+    #classify_loss = tf.reduce_mean(loss)
+    classify_loss = tf.reduce_sum(loss)
     tf.summary.scalar('classify loss', classify_loss)
 
     # Enforce the transformation as orthogonal matrix
